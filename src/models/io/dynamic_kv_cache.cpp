@@ -46,7 +46,9 @@ void DynamicKeyValueCache::Update(DeviceSpan<int32_t> beam_indices, int total_le
 }
 
 void DynamicKeyValueCache::RewindTo(size_t index) {
-  if (shape_[2] <= static_cast<int>(index)) {
+  // Update() keeps the length in shape_[2] only while every layer shares one shape.
+  const int current_length = layer_shapes_.empty() ? static_cast<int>(shape_[2]) : current_length_;
+  if (current_length <= static_cast<int>(index)) {
     throw std::runtime_error("Requested length of rewind is greater than the current length.");
   }
 
@@ -76,8 +78,10 @@ void DefaultKeyValueCacheBase::RewindPastTensorsTo(size_t index) {
   assert(index > 0 && !past_present_share_buffer_);
 
   if (!layer_shapes_.empty()) {
+    // A sequence dim of 0 marks an unbounded layer, as in Update(): shape_[2] and every
+    // layer_shapes_[i][2] stay 0 when the layers differ only in num_kv_heads/head_dim.
     const int max_length = static_cast<int>(shape_[2]);
-    if (static_cast<int>(index) > max_length) {
+    if (max_length > 0 && static_cast<int>(index) > max_length) {
       throw std::runtime_error("Requested rewind length exceeds max_length.");
     }
 
@@ -85,7 +89,8 @@ void DefaultKeyValueCacheBase::RewindPastTensorsTo(size_t index) {
       const int layer_idx = i / 2;
       const std::array<int64_t, 4> layer_shape = layer_shapes_[layer_idx];
       const int layer_max_cache = static_cast<int>(layer_shape[2]);
-      const int actual_rewind_length = std::min(static_cast<int>(index), layer_max_cache);
+      const int actual_rewind_length =
+          layer_max_cache > 0 ? std::min(static_cast<int>(index), layer_max_cache) : static_cast<int>(index);
 
       std::array<int64_t, 4> new_shape = layer_shape;
       new_shape[2] = actual_rewind_length;
