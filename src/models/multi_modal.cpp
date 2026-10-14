@@ -448,6 +448,14 @@ DeviceSpan<float> DecoderState::Run(int current_length, DeviceSpan<int32_t>& nex
   return logits_.Get();
 }
 
+void DecoderState::RewindTo(size_t index) {
+  position_inputs_->RewindTo(index);
+  if (kv_cache_)
+    kv_cache_->RewindTo(index);
+  if (recurrent_state_)
+    recurrent_state_->RewindTo(index);
+}
+
 bool DecoderState::SupportsPrefillChunking(bool has_multimodal_content) const {
   // Chunking slices the pre-computed embeddings along the sequence dimension, which is only
   // contiguous for a single sequence. Continuous decoding of position ids/attention mask in
@@ -617,12 +625,13 @@ DeviceSpan<float> MultiModalPipelineState::Run(int current_length, DeviceSpan<in
   }
   embedding_state_->UpdateInputsOutputs(next_tokens, is_prompt_);
 
-  // Prefill chunking (search.chunk_size): during the prompt stage the decoder can process the
-  // prompt embeddings in several smaller runs to bound peak memory usage.
+  // Prefill chunking (search.chunk_size): the decoder can process the embeddings of a long run in
+  // several smaller runs to bound peak memory usage. Tokens appended after the prompt, such as the
+  // re-prefill that follows RewindTo, are chunked the same way.
   const auto& chunk_size_opt = params_->search.chunk_size;
   const size_t num_tokens = next_tokens.size();
   const bool has_multimodal_content = num_image_tokens_ != 0 || num_audio_tokens_ != 0;
-  const bool chunk_prefill = is_prompt_ && chunk_size_opt.has_value() && chunk_size_opt.value() > 0 &&
+  const bool chunk_prefill = chunk_size_opt.has_value() && chunk_size_opt.value() > 0 &&
                              num_tokens > chunk_size_opt.value() && decoder_state_->SupportsPrefillChunking(has_multimodal_content);
 
   if (chunk_prefill) {
@@ -682,8 +691,16 @@ DeviceSpan<float> MultiModalPipelineState::Run(int current_length, DeviceSpan<in
   } else {
     embedding_state_->Run(current_length, next_tokens, next_indices);
   }
-  auto logits = decoder_state_->Run(current_length, next_tokens, next_indices);
+  auto logits = chunk_prefill
+                    ? decoder_state_->RunPrefillWithChunking(current_length, next_tokens, next_indices, chunk_size_opt.value())
+                    : decoder_state_->Run(current_length, next_tokens, next_indices);
   return audio_output_ ? SampleAudioOrText(logits) : logits;
+}
+
+void MultiModalPipelineState::RewindTo(size_t index) {
+  // Only the decoder keeps state across runs; the vision, speech and embedding models
+  // see just the tokens of the run they serve.
+  decoder_state_->RewindTo(index);
 }
 
 DeviceSpan<float> MultiModalPipelineState::SampleAudioOrText(DeviceSpan<float> logits) {
