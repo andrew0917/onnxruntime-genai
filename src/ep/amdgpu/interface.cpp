@@ -5,9 +5,11 @@
 //
 // GPU-resident KV cache for the AMDGPU device.
 //
-// p_device_ is an opaque device-buffer handle, so no pointer arithmetic or
-// dereference. All copies go through ORT's CopyTensors. Offset copies fall
-// back to CPU staging via CopyThroughCpu.
+// p_device_ is never dereferenced on the host: all copies go through ORT's
+// CopyTensors. Under the DirectX backend it is an opaque allocation handle that
+// can only be wrapped whole, so offset copies stage through the CPU via
+// CopyThroughCpu. The HIP backends (profile hip or migraphx) hand out HIP device
+// pointers, so there an offset copy wraps just the range and stays on the device.
 
 #include "generator/generators.h"
 #include "config_utils.h"
@@ -17,6 +19,8 @@
 #include "interface.h"
 #include "session_options.h"  // AMDGPUExecutionProvider::ReleaseOwnedUmbrellaEp (teardown ownership gate)
 
+#include <algorithm>
+#include <cctype>
 #include <stdexcept>
 
 namespace Generators {
@@ -25,15 +29,32 @@ namespace AMDGPU {
 const char* device_label = "amdgpu";
 const char* label_cpu = "cpu";
 
+// Whether the provider options select a backend whose device memory is HIP device pointers.
+// "auto" may route to DirectX, so only an explicit hip or migraphx profile counts.
+static bool SelectsHipBackend(const ProviderOptions* options) {
+  if (!options)
+    return false;
+  for (const auto& [name, value] : options->options) {
+    if (name != "profile")
+      continue;
+    std::string profile = value;
+    std::transform(profile.begin(), profile.end(), profile.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    // The EP also takes the profiles by number: 3 is migraphx, 5 is hip.
+    return profile == "hip" || profile == "migraphx" || profile == "5" || profile == "3";
+  }
+  return false;
+}
+
 struct GpuMemory final : DeviceBuffer {
-  GpuMemory(size_t size, Ort::Allocator* allocator, const OrtMemoryInfo* memory_info)
-      : owned_{true}, ort_allocator_{allocator}, ort_memory_info_{memory_info} {
+  GpuMemory(size_t size, Ort::Allocator* allocator, const OrtMemoryInfo* memory_info, bool device_pointers)
+      : owned_{true}, ort_allocator_{allocator}, ort_memory_info_{memory_info}, device_pointers_{device_pointers} {
     size_in_bytes_ = size;
     p_device_ = static_cast<uint8_t*>(ort_allocator_->Alloc(size_in_bytes_));
   }
 
-  GpuMemory(void* p, size_t size, Ort::Allocator* allocator, const OrtMemoryInfo* memory_info)
-      : owned_{false}, ort_allocator_{allocator}, ort_memory_info_{memory_info} {
+  GpuMemory(void* p, size_t size, Ort::Allocator* allocator, const OrtMemoryInfo* memory_info, bool device_pointers)
+      : owned_{false}, ort_allocator_{allocator}, ort_memory_info_{memory_info}, device_pointers_{device_pointers} {
     size_in_bytes_ = size;
     p_device_ = static_cast<uint8_t*>(p);
   }
@@ -91,32 +112,28 @@ struct GpuMemory final : DeviceBuffer {
     if (!ort_allocator_)
       throw std::runtime_error("AMDGPU allocator not initialized");
 
-    // Opaque handle, so wrap the whole buffer and let CopyTensors do the copy.
-    if (strcmp(source.GetType(), device_label) == 0 && begin_source == 0 && begin_dest == 0) {
-      // Full-buffer device-to-device copy.
-      int64_t shape_val = static_cast<int64_t>(size_in_bytes);
-      std::span<const int64_t> shape{&shape_val, 1};
-      auto src_tensor = OrtValue::CreateTensor(*ort_memory_info_, source.p_device_, size_in_bytes, shape, ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8);
-      auto dst_tensor = OrtValue::CreateTensor(*ort_memory_info_, p_device_, size_in_bytes, shape, ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8);
-
-      const std::vector<const OrtValue*> src_ptrs = {src_tensor.get()};
-      const std::vector<OrtValue*> dst_ptrs = {dst_tensor.get()};
-      GetOrtEnv().CopyTensors(src_ptrs, dst_ptrs, nullptr);
-    } else if (strcmp(source.GetType(), label_cpu) == 0 && begin_source == 0 && begin_dest == 0) {
-      // Full-buffer CPU-to-device copy.
-      int64_t shape_val = static_cast<int64_t>(size_in_bytes);
-      std::span<const int64_t> shape{&shape_val, 1};
-      auto cpu_mem_info = OrtMemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeDefault);
-      auto src_tensor = OrtValue::CreateTensor(*cpu_mem_info, source.p_device_, size_in_bytes, shape, ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8);
-      auto dst_tensor = OrtValue::CreateTensor(*ort_memory_info_, p_device_, size_in_bytes, shape, ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8);
-
-      const std::vector<const OrtValue*> src_ptrs = {src_tensor.get()};
-      const std::vector<OrtValue*> dst_ptrs = {dst_tensor.get()};
-      GetOrtEnv().CopyTensors(src_ptrs, dst_ptrs, nullptr);
-    } else {
-      // Offset copies can't sub-buffer-view an opaque handle, so stage through CPU.
+    // Wrap the range in byte tensors and let CopyTensors do the copy. An opaque handle can only
+    // be wrapped whole, so its offset copies stage through the CPU instead.
+    const bool from_device = strcmp(source.GetType(), device_label) == 0;
+    const bool from_cpu = strcmp(source.GetType(), label_cpu) == 0;
+    const bool whole = begin_source == 0 && begin_dest == 0;
+    if (!(from_device || from_cpu) || !(whole || device_pointers_)) {
       CopyThroughCpu(*this, begin_dest, source, begin_source, size_in_bytes);
+      return;
     }
+
+    int64_t shape_val = static_cast<int64_t>(size_in_bytes);
+    std::span<const int64_t> shape{&shape_val, 1};
+    std::unique_ptr<OrtMemoryInfo> cpu_mem_info;
+    if (from_cpu)
+      cpu_mem_info = OrtMemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeDefault);
+    const OrtMemoryInfo& source_mem_info = from_cpu ? *cpu_mem_info : *ort_memory_info_;
+    auto src_tensor = OrtValue::CreateTensor(source_mem_info, source.p_device_ + begin_source, size_in_bytes, shape, ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8);
+    auto dst_tensor = OrtValue::CreateTensor(*ort_memory_info_, p_device_ + begin_dest, size_in_bytes, shape, ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8);
+
+    const std::vector<const OrtValue*> src_ptrs = {src_tensor.get()};
+    const std::vector<OrtValue*> dst_ptrs = {dst_tensor.get()};
+    GetOrtEnv().CopyTensors(src_ptrs, dst_ptrs, nullptr);
   }
 
   void Zero() override {
@@ -141,6 +158,7 @@ struct GpuMemory final : DeviceBuffer {
   bool owned_;  // If we own the memory, we free it on destruction
   Ort::Allocator* ort_allocator_;
   const OrtMemoryInfo* ort_memory_info_;
+  bool device_pointers_;  // p_device_ is a HIP device pointer, so it can be wrapped at an offset
 };
 
 const char* pinned_device_label = "amdgpu_pinned";
@@ -206,6 +224,7 @@ struct InterfaceImpl : DeviceInterface {
     ort_allocator_ = nullptr;
     ort_memory_info_ = nullptr;
     ort_pinned_allocator_ = nullptr;
+    device_pointers_ = false;
     device_id_ = 0;
   }
 
@@ -250,7 +269,11 @@ struct InterfaceImpl : DeviceInterface {
   // Pick up the host-accessible allocator advertised on the same device as the compute allocator,
   // so the pinned decode inputs live on the device that runs the model. If the EP advertises none,
   // this leaves the allocator null and callers keep the default device-memory path.
-  void InitDeviceAllocators(const ProviderOptions* /*user_options*/, int device_id) override {
+  //
+  // The backend is read along with the allocators, from the options of the model they are built
+  // for; a model loaded while another AMDGPU model is alive shares both.
+  void InitDeviceAllocators(const ProviderOptions* user_options, int device_id) override {
+    device_pointers_ = SelectsHipBackend(user_options);
     if (ort_pinned_allocator_)
       return;
     try {
@@ -279,11 +302,11 @@ struct InterfaceImpl : DeviceInterface {
   Ort::Allocator* PinnedAllocator() const { return ort_pinned_allocator_; }
 
   std::shared_ptr<DeviceBuffer> AllocateBase(size_t size) override {
-    return std::make_shared<GpuMemory>(size, ort_allocator_, ort_memory_info_);
+    return std::make_shared<GpuMemory>(size, ort_allocator_, ort_memory_info_, device_pointers_);
   }
 
   std::shared_ptr<DeviceBuffer> WrapMemoryBase(void* p, size_t size) override {
-    return std::make_shared<GpuMemory>(p, size, ort_allocator_, ort_memory_info_);
+    return std::make_shared<GpuMemory>(p, size, ort_allocator_, ort_memory_info_, device_pointers_);
   }
 
   std::unique_ptr<Search> CreateGreedy(const GeneratorParams& params) override {
@@ -309,6 +332,8 @@ struct InterfaceImpl : DeviceInterface {
   const OrtMemoryInfo* ort_memory_info_{};
   // Host-accessible allocator, set by InitDeviceAllocators when the EP advertises one.
   Ort::Allocator* ort_pinned_allocator_{};
+  // Set by InitDeviceAllocators when the options select a HIP backend.
+  bool device_pointers_{};
   int device_id_{};
 };
 
